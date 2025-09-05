@@ -1,0 +1,177 @@
+/**
+ * YouTube placements with Cyrillic (LAST_7_DAYS) — GAQL (group_placement_view)
+ * - Filters: campaign.advertising_channel_type = 'VIDEO'
+ * - Detects Cyrillic in display_name or placement
+ * - Emails TWO CSV attachments:
+ *    1) Report.csv — plný report (kampaně, sestavy, metriky, PlacementUrl s fallback "N/A")
+ *    2) Exclusions.csv — jen DisplayName a PlacementUrl (deduplikováno podle URL; fallback "N/A")
+ */
+
+const EMAIL_RECIPIENTS = ['you@example.com']; // <-- změň na své e-maily
+const MIN_IMPRESSIONS = 1; // volitelné: minimální počet impresí
+
+function main() {
+  const rows = fetchPlacementRowsGAQL();
+  const cyrillicRows = rows.filter(isCyrillicRow);
+
+  const accountName = AdsApp.currentAccount().getName();
+  const currency = AdsApp.currentAccount().getCurrencyCode();
+
+  if (cyrillicRows.length === 0) {
+    sendMail(
+      `YouTube umístění s azbukou – nic nenalezeno (posledních 7 dní)`,
+      `Účet: ${accountName}\nV období posledních 7 dní nebyla nalezena žádná umístění s názvem v azbuce (kampaně typu VIDEO).`,
+      null
+    );
+    return;
+  }
+
+  // Dedup pro plný report (konzervativní, aby zůstal 1:1 k řádkům)
+  const dedupedReport = dedupeRows(
+    cyrillicRows,
+    r => `${r.displayName}||${r.placementUrl}||${r.placement}||${r.campaignName}||${r.adGroupName}`
+  );
+
+  // ---- Report.csv (plný) ----
+  const reportHeaders = [
+    'CampaignName',
+    'AdGroupName',
+    'DisplayName',
+    'Placement',
+    'PlacementUrl',
+    'Impressions',
+    'Clicks',
+    `Cost (${currency})`
+  ];
+  const reportCsv = toCsv(
+    reportHeaders,
+    dedupedReport.map(r => ({
+      CampaignName: r.campaignName,
+      AdGroupName: r.adGroupName,
+      DisplayName: r.displayName,
+      Placement: r.placement,
+      PlacementUrl: r.placementUrl ? r.placementUrl : 'N/A',
+      Impressions: r.impressions,
+      Clicks: r.clicks,
+      Cost: microsToCurrency(r.costMicros)
+    }))
+  );
+
+  // Dedup pro Exclusions.csv — hlavně podle URL; pokud URL chybí, podle display name
+  const dedupedForExclusions = dedupeRows(
+    cyrillicRows,
+    r => (r.placementUrl && r.placementUrl.trim() !== '' ? r.placementUrl.trim().toLowerCase()
+                                                         : (r.displayName || '').trim().toLowerCase())
+  );
+
+  // ---- Exclusions.csv (jen 2 sloupce, deduplikováno) ----
+  const exclusionsHeaders = ['DisplayName', 'PlacementUrl'];
+  const exclusionsCsv = toCsv(
+    exclusionsHeaders,
+    dedupedForExclusions.map(r => ({
+      DisplayName: r.displayName,
+      PlacementUrl: r.placementUrl ? r.placementUrl : 'N/A'
+    }))
+  );
+
+  const subject = `YouTube umístění s azbukou – ${accountName} (posledních 7 dní)`;
+  const body =
+    `Přikládám dva CSV soubory:\n` +
+    `• Report.csv – podrobný report (YouTube/VIDEO, posledních 7 dní)\n` +
+    `• Exclusions.csv – pouze DisplayName a PlacementUrl (deduplikováno podle URL)\n\n` +
+    `Účet: ${accountName}\n` +
+    `Počet řádků v Report.csv: ${dedupedReport.length}\n` +
+    `Počet řádků v Exclusions.csv (po deduplikaci): ${dedupedForExclusions.length}\n` +
+    `Filtr: Impressions >= ${MIN_IMPRESSIONS}\n`;
+
+  const attachments = [
+    Utilities.newBlob(reportCsv, 'text/csv', 'Report.csv'),
+    Utilities.newBlob(exclusionsCsv, 'text/csv', 'Exclusions.csv')
+  ];
+
+  sendMail(subject, body, attachments);
+}
+
+/** GAQL: group_placement_view + metrics over LAST_7_DAYS, VIDEO only */
+function fetchPlacementRowsGAQL() {
+  const query = `
+    SELECT
+      campaign.name,
+      ad_group.name,
+      group_placement_view.display_name,
+      group_placement_view.placement,
+      group_placement_view.target_url,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.cost_micros
+    FROM group_placement_view
+    WHERE campaign.advertising_channel_type = 'VIDEO'
+      AND metrics.impressions >= ${MIN_IMPRESSIONS}
+      AND segments.date DURING LAST_7_DAYS
+  `;
+
+  const it = AdsApp.search(query);
+  const rows = [];
+  while (it.hasNext()) {
+    const row = it.next();
+    rows.push({
+      campaignName: safeStr(row.campaign && row.campaign.name),
+      adGroupName: safeStr(row.adGroup && row.adGroup.name),
+      displayName: safeStr(row.groupPlacementView && row.groupPlacementView.displayName),
+      placement:   safeStr(row.groupPlacementView && row.groupPlacementView.placement),
+      placementUrl:safeStr(row.groupPlacementView && row.groupPlacementView.targetUrl),
+      impressions: Number((row.metrics && row.metrics.impressions) || 0),
+      clicks:      Number((row.metrics && row.metrics.clicks) || 0),
+      costMicros:  Number((row.metrics && row.metrics.costMicros) || 0)
+    });
+  }
+  return rows;
+}
+
+/** Detect Cyrillic in displayName or placement */
+function isCyrillicRow(r) {
+  // Základní cyrilice \u0400–\u04FF; případně lze rozšířit o \u0500–\u052F, \u2DE0–\u2DFF, \uA640–\uA69F
+  const cyr = /[\u0400-\u04FF]/;
+  return (r.displayName && cyr.test(r.displayName)) || (r.placement && cyr.test(r.placement));
+}
+
+/** Helpers */
+function safeStr(v) { return v == null ? '' : String(v); }
+function microsToCurrency(micros) { return (micros / 1e6).toFixed(2); }
+
+function dedupeRows(arr, keyFn) {
+  const seen = Object.create(null);
+  const out = [];
+  for (var i = 0; i < arr.length; i++) {
+    const k = keyFn(arr[i]);
+    if (!seen[k]) { seen[k] = true; out.push(arr[i]); }
+  }
+  return out;
+}
+
+function toCsv(headers, rows) {
+  const lines = [];
+  lines.push(headers.map(csvEscape).join(','));
+  rows.forEach(obj => {
+    const line = headers.map(h => csvEscape(obj[h])).join(',');
+    lines.push(line);
+  });
+  return lines.join('\n');
+}
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const s = String(value);
+  if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function sendMail(subject, body, blobsOrNull) {
+  EMAIL_RECIPIENTS.forEach(to => {
+    if (blobsOrNull && blobsOrNull.length) {
+      MailApp.sendEmail({ to, subject, body, attachments: blobsOrNull });
+    } else {
+      MailApp.sendEmail(to, subject, body);
+    }
+  });
+}
