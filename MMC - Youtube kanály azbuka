@@ -1,0 +1,279 @@
+/**
+ * MCC (Manager) — YouTube placements with Cyrillic (LAST_7_DAYS)
+ * - Iterates child accounts under MCC (optionally only ACCOUNT_IDS)
+ * - GAQL: FROM group_placement_view
+ * - Filters VIDEO campaigns, impressions >= MIN_IMPRESSIONS
+ * - Detects Cyrillic in display_name/placement
+ * - Emails TWO CSV attachments:
+ *    1) Report.csv — full report (AccountName/Id, Campaign, AdGroup, metrics, PlacementUrl "N/A" fallback)
+ *    2) Exclusions.csv — only DisplayName, PlacementUrl (deduplicated by URL across all accounts; fallback "N/A")
+ *
+ * Notes:
+ * - Set EMAIL_RECIPIENTS below.
+ * - If CONSOLIDATE_ACCOUNTS=false, you'll get per-account CSV pairs as separate attachments.
+ */
+
+const EMAIL_RECIPIENTS = [
+  'you@example.com'
+]; // <- uprav adresy
+
+const ACCOUNT_IDS = []; // např. ['123-456-7890','111-222-3333']; nech prázdné = všechny děti MCC
+const MIN_IMPRESSIONS = 1;
+const CONSOLIDATE_ACCOUNTS = true; // true = jeden Report.csv + Exclusions.csv za všechny účty
+
+function main() {
+  const accSel = ACCOUNT_IDS.length
+    ? AdsManagerApp.accounts().withIds(ACCOUNT_IDS)
+    : AdsManagerApp.accounts();
+
+  const accIt = accSel.get();
+
+  // Shromažďovač přes všechny účty (pro konsolidovaný režim)
+  const allRows = [];
+
+  // Pokud budeme posílat per-account soubory
+  const perAccountAttachments = [];
+
+  while (accIt.hasNext()) {
+    const account = accIt.next();
+    AdsManagerApp.select(account);
+
+    const accountName = AdsApp.currentAccount().getName();
+    const accountId = AdsApp.currentAccount().getCustomerId();
+    const currency = AdsApp.currentAccount().getCurrencyCode();
+
+    const rows = fetchPlacementRowsGAQL();
+
+    // obohatíme o info o účtu
+    rows.forEach(r => {
+      r.accountName = accountName;
+      r.accountId = accountId;
+      r.currency = currency;
+    });
+
+    const cyrillicRows = rows.filter(isCyrillicRow);
+
+    if (CONSOLIDATE_ACCOUNTS) {
+      allRows.push.apply(allRows, cyrillicRows);
+    } else {
+      // připravíme přílohy pro tento účet (pokud je co posílat)
+      if (cyrillicRows.length > 0) {
+        const { reportBlob, exclusionsBlob } = buildCsvBlobsForRows(cyrillicRows, /*consolidated=*/false);
+        // pojmenuj přílohy s ID účtu
+        perAccountAttachments.push(
+          Utilities.newBlob(reportBlob.getBytes(), 'text/csv', `Report_${accountId}.csv`)
+        );
+        perAccountAttachments.push(
+          Utilities.newBlob(exclusionsBlob.getBytes(), 'text/csv', `Exclusions_${accountId}.csv`)
+        );
+      }
+    }
+  }
+
+  // Sestavení e-mailu
+  if (CONSOLIDATE_ACCOUNTS) {
+    if (allRows.length === 0) {
+      sendMail(
+        `MCC: YouTube umístění s azbukou – nic nenalezeno (posledních 7 dní)`,
+        `V žádném z vybraných účtů nebyla za posledních 7 dní nalezena umístění s azbukou (VIDEO kampaně).`,
+        null
+      );
+      return;
+    }
+
+    const { reportBlob, exclusionsBlob } = buildCsvBlobsForRows(allRows, /*consolidated=*/true);
+
+    const attachments = [
+      Utilities.newBlob(reportBlob.getBytes(), 'text/csv', 'Report.csv'),
+      Utilities.newBlob(exclusionsBlob.getBytes(), 'text/csv', 'Exclusions.csv')
+    ];
+
+    const summary = summarizeAccounts(allRows);
+    const body =
+      `Přikládám konsolidované CSV soubory za všechny zpracované účty (posledních 7 dní):\n` +
+      `• Report.csv – podrobný report\n` +
+      `• Exclusions.csv – pouze DisplayName a PlacementUrl (deduplikace podle URL napříč všemi účty)\n\n` +
+      `Souhrn podle účtů:\n${summary}\n` +
+      `Filtr: Impressions >= ${MIN_IMPRESSIONS}\n`;
+
+    sendMail(`MCC: YouTube umístění s azbukou – konsolidovaný report`, body, attachments);
+  } else {
+    if (perAccountAttachments.length === 0) {
+      sendMail(
+        `MCC: YouTube umístění s azbukou – nic nenalezeno (posledních 7 dní)`,
+        `V žádném z vybraných účtů nebyla za posledních 7 dní nalezena umístění s azbukou (VIDEO kampaně).`,
+        null
+      );
+      return;
+    }
+    const body =
+      `Přikládám páry CSV souborů pro jednotlivé účty (Report_*.csv a Exclusions_*.csv).\n` +
+      `Filtr: Impressions >= ${MIN_IMPRESSIONS}\n`;
+    sendMail(`MCC: YouTube umístění s azbukou – reporty po účtech`, body, perAccountAttachments);
+  }
+}
+
+/** Vrátí data z GAQL: group_placement_view (VIDEO, LAST_7_DAYS) pro AKTUÁLNĚ vybraný účet */
+function fetchPlacementRowsGAQL() {
+  const query = `
+    SELECT
+      campaign.name,
+      ad_group.name,
+      group_placement_view.display_name,
+      group_placement_view.placement,
+      group_placement_view.target_url,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.cost_micros
+    FROM group_placement_view
+    WHERE campaign.advertising_channel_type = 'VIDEO'
+      AND metrics.impressions >= ${MIN_IMPRESSIONS}
+      AND segments.date DURING LAST_7_DAYS
+  `;
+  const it = AdsApp.search(query);
+  const rows = [];
+  while (it.hasNext()) {
+    const row = it.next();
+    rows.push({
+      campaignName: safeStr(row.campaign && row.campaign.name),
+      adGroupName: safeStr(row.adGroup && row.adGroup.name),
+      displayName: safeStr(row.groupPlacementView && row.groupPlacementView.displayName),
+      placement:   safeStr(row.groupPlacementView && row.groupPlacementView.placement),
+      placementUrl:safeStr(row.groupPlacementView && row.groupPlacementView.targetUrl),
+      impressions: Number((row.metrics && row.metrics.impressions) || 0),
+      clicks:      Number((row.metrics && row.metrics.clicks) || 0),
+      costMicros:  Number((row.metrics && row.metrics.costMicros) || 0)
+    });
+  }
+  return rows;
+}
+
+/** Vytvoří dvě CSV přílohy (Report + Exclusions) z dodaných řádků. */
+function buildCsvBlobsForRows(inputRows, consolidated) {
+  // Report — deduplikujeme konzervativně (ponecháme kombinaci polí)
+  const dedupReport = dedupeRows(
+    inputRows,
+    r => `${r.accountId}||${r.campaignName}||${r.adGroupName}||${r.displayName}||${r.placement}||${r.placementUrl}`
+  );
+
+  // Report headers (přidán AccountName/Id)
+  const currencyHint = detectCurrencyHint(inputRows);
+  const reportHeaders = [
+    'AccountName',
+    'AccountId',
+    'CampaignName',
+    'AdGroupName',
+    'DisplayName',
+    'Placement',
+    'PlacementUrl',
+    'Impressions',
+    'Clicks',
+    `Cost (${currencyHint})`
+  ];
+
+  const reportCsv = toCsv(
+    reportHeaders,
+    dedupReport.map(r => ({
+      AccountName: r.accountName,
+      AccountId: r.accountId,
+      CampaignName: r.campaignName,
+      AdGroupName: r.adGroupName,
+      DisplayName: r.displayName,
+      Placement: r.placement,
+      PlacementUrl: r.placementUrl ? r.placementUrl : 'N/A',
+      Impressions: r.impressions,
+      Clicks: r.clicks,
+      [`Cost (${currencyHint})`]: microsToCurrency(r.costMicros)
+    }))
+  );
+
+  // Exclusions — dedup hlavně podle URL (globálně, tj. i napříč účty)
+  const dedupExclusions = dedupeRows(
+    inputRows,
+    r => (r.placementUrl && r.placementUrl.trim() !== ''
+          ? r.placementUrl.trim().toLowerCase()
+          : (r.displayName || '').trim().toLowerCase())
+  );
+
+  const exclusionsHeaders = ['DisplayName', 'PlacementUrl'];
+  const exclusionsCsv = toCsv(
+    exclusionsHeaders,
+    dedupExclusions.map(r => ({
+      DisplayName: r.displayName,
+      PlacementUrl: r.placementUrl ? r.placementUrl : 'N/A'
+    }))
+  );
+
+  return {
+    reportBlob: Utilities.newBlob(reportCsv, 'text/csv', 'Report.csv'),
+    exclusionsBlob: Utilities.newBlob(exclusionsCsv, 'text/csv', 'Exclusions.csv')
+  };
+}
+
+/** Zjistí měnový kód (pro název sloupce Cost) — v konsolidovaném režimu vezmeme první nalezený */
+function detectCurrencyHint(rows) {
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].currency) return rows[i].currency;
+  }
+  return 'AccountCurrency';
+}
+
+/** Detekce azbuky */
+function isCyrillicRow(r) {
+  const cyr = /[\u0400-\u04FF]/;
+  return (r.displayName && cyr.test(r.displayName)) || (r.placement && cyr.test(r.placement));
+}
+
+/** Utility */
+function safeStr(v) { return v == null ? '' : String(v); }
+function microsToCurrency(micros) { return (micros / 1e6).toFixed(2); }
+
+function dedupeRows(arr, keyFn) {
+  const seen = Object.create(null);
+  const out = [];
+  for (var i = 0; i < arr.length; i++) {
+    const k = keyFn(arr[i]);
+    if (!seen[k]) { seen[k] = true; out.push(arr[i]); }
+  }
+  return out;
+}
+
+function toCsv(headers, rows) {
+  const lines = [];
+  lines.push(headers.map(csvEscape).join(','));
+  rows.forEach(obj => {
+    const line = headers.map(h => csvEscape(obj[h])).join(',');
+    lines.push(line);
+  });
+  return lines.join('\n');
+}
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const s = String(value);
+  if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+/** Odeslání (každému příjemci zvlášť) — attachments může být null nebo pole blobů */
+function sendMail(subject, body, attachmentsOrNull) {
+  EMAIL_RECIPIENTS.forEach(to => {
+    if (attachmentsOrNull && attachmentsOrNull.length) {
+      MailApp.sendEmail({ to, subject, body, attachments: attachmentsOrNull });
+    } else {
+      MailApp.sendEmail(to, subject, body);
+    }
+  });
+}
+
+/** Malý souhrn počtu řádků za účet (pro text e-mailu) */
+function summarizeAccounts(rows) {
+  const map = Object.create(null);
+  rows.forEach(r => {
+    const key = `${r.accountName} (${r.accountId})`;
+    map[key] = (map[key] || 0) + 1;
+  });
+  const parts = [];
+  for (var k in map) parts.push(`- ${k}: ${map[k]} řádků`);
+  return parts.sort().join('\n');
+}
